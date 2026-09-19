@@ -871,7 +871,260 @@ perfect double-free there is a sandbox-escape *primitive*, and no escalation ste
 
 ---
 
-## 11. BOTTOM LINE
+## 11. THE §10 LEAD IS REFUTED — the command slots are cleared twice per request
+
+§10 proposed a double release of an `IODMACommand` via a stale command slot. Chasing the
+precondition through the request lifecycle **kills it**, and the evidence is unambiguous.
+
+### 11.1 The abort path §10 relied on does exist — and is harmless
+
+`setupBuffersForCoding_gated` (`0x9017b7c` … `0x9017fe8`) sets descriptor A from the IOSurface
+accessor, then runs a descriptor prepare whose failure bails out **before** the command-slot clear:
+
+```
+0x9017ed0  str   x0, [x19, #0x2c8]      ; descriptor A = getter(...)
+0x9017ed4  cbz   x0, #0xfffffff009017f48
+0x9017ef0  blraa x8, x16                ; retain it
+0x9017ef4  ldr   x0, [x19, #0x2c8]
+0x9017f14  blraa x8, x16                ; descriptor->vtable[0xd8](0)   -- a prepare
+0x9017f18  cbz   w0, #0xfffffff009017f70 ; success -> 0x9017f70 (clear + maps)
+0x9017f1c  ... log ...                  ; FAILURE:
+0x9017f44  b     #0xfffffff009017c34    ;   bail out -- 0x9017f7c is SKIPPED
+...
+0x9017f70  mov   w8, #1
+0x9017f74  strb  w8, [x19, #0x2dc]
+0x9017f7c  str   q0, [x19, #0x300]      ; clear BOTH command slots
+0x9017f90  bl    #0xfffffff009017844    ; doRestOfBufferSetupForEncode_gated (maps)
+0x9017fac  bl    #0xfffffff0090171fc    ; doRestOfBufferSetupForDecode_gated (maps)
+```
+
+So §10's precondition — *descriptor set, command slot stale, map never ran* — is reachable at
+`0x9017f18`. The question was whether the slot can be **non-zero** at that moment.
+
+### 11.2 It cannot: the slots are zeroed at request start and again before every map
+
+Two independent clears stand in the way, and they are on the same `JpegRequest` object:
+
+1. **The full request reset** — `0x90183b0`, called from the selector-7 implementation at
+   `0x901a3f0`. It takes the request in `x0` (`mov x19, x0`), and the caller passes `x21`, which is
+   the `JpegRequest` itself (the very next instructions store `[x21,#0x10]`, `[x21,#0x20]`,
+   `[x21,#0x2ac]`). It clears `+0x300`…`+0x30F` at `0x901840c`.
+2. **The pre-map clear** in `setupBuffersForCoding_gated` at `0x9017f7c`, which runs on the success
+   path *before* both setup functions that perform the maps.
+
+So at the moment the abort path at `0x9017f18` is taken, the command slots are **0** — they were
+zeroed by the reset (1) and would have been zeroed again by (2) had the flow reached it. The
+teardown's `cbz x3` therefore skips, and no stale command is ever unmapped.
+
+**Verdict: §10 is a refuted lead, not a finding.** The driver's DMA bookkeeping is more careful
+than it first looked: it clears the command slots redundantly (at request reset *and* immediately
+before the maps), which is exactly the defence against the stale-slot double release.
+
+### 11.3 What the refutation does *not* cover
+
+One path remains untested and is the honest place to pick this up again: **a second
+`setupBuffersForCoding_gated` pass on the same request without an intervening reset.** The
+sel-7 path resets first, so a single call is safe; a retry loop that re-enters the setup on the
+same object would leave the slots holding the previous pass's command while the descriptor is
+re-set — which is precisely the stale-slot state. Nothing in the traced flow does that, but the
+`IOCommandGate` dispatch (six selectors funnel into `queue_io_gated`) means the call count per
+request is not something I have closed out.
+
+---
+
+## 12. THE FINISH PATH OVER-RELEASES THE CLIENT'S IOSURFACE IF ENTERED TWICE
+
+§11 killed the *command-slot* double unmap, because the teardown clears the descriptor slots. The
+same sweep found the one field where that protection is **absent** — and it is the field the client
+supplies.
+
+### 12.1 The teardown releases `JpegRequest+0x2b8` and never clears it
+
+```
+0x9018084  ldr   x0, [x19, #0x2b8]        ; <<< the IOSurface
+0x9018088  cbz   x0, #0xfffffff0090180cc  ; guarded by NULL only
+0x901808c  ldrb  w8, [x19, #0x2d8]
+0x9018090  tbz   w8, #0, #0xfffffff0090180b0
+0x9018094  ldrb  w8, [x19, #0x2da]
+0x9018098  tbz   w8, #0, #0xfffffff0090180a4
+0x901809c  bl    #0xfffffff00903c8c8
+0x90180a0  ldr   x0, [x19, #0x2b8]
+0x90180a4  mov   w1, #1
+0x90180a8  bl    #0xfffffff00903c898
+0x90180ac  ldr   x0, [x19, #0x2b8]
+0x90180b0  ldr   x16, [x0]
+0x90180c0  ldr   x8, [x16, #0x28]!        ; vtable[0x28] = OSObject::release (div 0x3a87)
+0x90180c8  blraa x8, x16                  ; <<< RELEASE -- and nothing clears the slot after it
+```
+
+The access sweep over the whole JPEG kext confirms it: `[+0x2b8]` is **read** by the teardown and
+**zeroed** only by the request resets (`str xzr,[x19,#0x2b8]` at `0x90183f4`, and `str q0,[x24]`
+with `x24 = req+0x2b8` at `0x9017bac`). **The teardown itself never clears it.**
+
+Contrast the same function's handling of the command slots: it *does* clear the descriptors
+(`str xzr,[x19,#0x2c8]` at `0x9018080`, `str xzr,[x19,#0x2d0]` at `0x90181a4`), which is precisely
+what makes the command double-unmap harmless (§11). **The IOSurface has no equivalent guard.**
+
+### 12.2 Two entry points into the same teardown, with independent guards
+
+The teardown (`0x9017fe8`) has exactly one caller, the helper `0x901b440`, and that helper calls it
+**unconditionally**:
+
+```
+0x901b474  mov   x0, x20
+0x901b478  mov   x1, x19
+0x901b47c  mov   w2, #0
+0x901b480  bl    #0xfffffff009017fe4      ; the DMA teardown -- no guard
+```
+
+…and `0x901b440` itself has **two** callers:
+
+| site | enclosing function | guard | call |
+|---|---|---|---|
+| `0x9016f80` | `AppleJPEGDriver::finish_io_gated` (`0x9016af0`) | `ldr x8,[x19,#0x10] ; cbz x8, …` — `[req+0x10] != 0` | — |
+| `0x90191bc` | `queue_io_gated` (`0x9018c0c`) | result code `w21 == 0 \|\| w21 == 0xe00002e8`, then `x23 == 0 \|\| w22 == 0` | — |
+
+### 12.2b `finish_io_gated` itself is reached from BOTH the sync and the async path
+
+`finish_io_gated` (entry `0x9016aec`) has exactly **two** direct callers, and they are the classic
+double-completion pair:
+
+```
+; caller 1 -- AppleJPEGDriver::begin_io_gated(bool)   [0x9015c3c]
+0x9015e48  ldr   x1, [x24, #8]        ; the request
+0x9015e50  mov   x2, x25              ; IOReturn
+0x9015e54  mov   x3, x20
+0x9015e58  mov   w4, #0               ; bool = FALSE
+0x9015e5c  bl    #0xfffffff009016aec  ; finish_io_gated(req, err, arg, false)   -- SYNCHRONOUS
+
+; caller 2 -- AppleJPEGDriver::interruptOccurred_gated(JpegRequest *, uint32_t)  [0x90166d4]
+0x9016730  mov   w8, #1
+0x9016734  strb  w8, [x0, #0xc8]      ; a DRIVER flag (not the request)
+0x9016740  mov   w4, #1               ; bool = TRUE
+0x9016744  bl    #0xfffffff009016aec  ; finish_io_gated(req, 0, arg, true)    -- ASYNCHRONOUS
+0x9016748  strb  wzr, [x19, #0xc8]
+```
+
+So one `JpegRequest` can be finished by **the synchronous submission path** (a failed
+`begin_io_gated`, `bool = false`) and by **the hardware interrupt completion**
+(`interruptOccurred_gated`, `bool = true`). Those are exactly the two entries that a driver has to
+make mutually exclusive — and the one-shot guard they would use for that (`[req+0x10]`) is a field
+that **neither** path clears (§12.3).
+
+### 12.3 The guard is not consumed
+
+A narrow store sweep over both `finish_io_gated` and the helper `0x901b440` finds **no write at all**
+to `[req+0x10]`, `[req+0x2b8]`, `[req+0x2c8]`, `[req+0x2d0]`, `[req+0x300]` or `[req+0x308]`:
+
+```
+--- helper 0x901b440 (calls the teardown) [0x901b440,0x901b660) ---
+--- finish_io_gated                        [0x9016c00,0x90171fc) ---
+   (nothing)
+```
+
+So `finish_io_gated` **does not consume its own guard**, and the release of `[+0x2b8]` has **no
+one-shot protection anywhere on the release path**. The only clear is at the *start of the next
+request*.
+
+### 12.4 The lead, stated precisely
+
+> **If the finish path runs twice for one `JpegRequest`, the client-supplied IOSurface is released
+> twice** — a plain `OSObject::release` over-release on an object the caller chose. That is the
+> classic over-release UAF, and unlike §10 it is not defended by a clear.
+
+Why this is a better lead than §10:
+
+* the object is the **client-supplied IOSurface** (attacker-influenced), not a driver-internal
+  command;
+* the protection that killed §10 — clearing the slot — is **absent** here;
+* the trigger is a **second finish**, not a failed map: `finish_io_gated`'s guard is a persistent
+  field that nothing on the finish path clears, so the natural "already finished" defence is
+  missing.
+
+### 12.5 The one remaining question
+
+**Can `finish_io_gated` be entered twice for one request?** That is now the whole question, and it
+is a bounded read:
+
+* identify what **sets** `[req+0x10]` (three candidates write a 32-bit value there:
+  `0x9019df0`, `0x901a300`, `0x901ae20`, all `str w8,[x20,#0x10]` inside selector
+  implementations) and whether it is cleared anywhere between two finishes;
+* check whether the `queue_io_gated` finish (guard: result code) and the `finish_io_gated` finish
+  (guard: `[+0x10]`) can both be taken for one job — the asynchronous interrupt completion and the
+  synchronous error path are exactly the pair that would do it.
+
+**Status: a lead, not a proven UAF.** The double-release primitive is confirmed
+(`OSObject::release` with no slot clear and no consumed guard); the reachability of a double finish
+is not.
+
+---
+
+## 13. LPE HUNT — the client-pointer avenue is REFUTED; the driver resolves IDs
+
+An LPE here means a **sandboxed app gaining kernel privilege**. That reduces to: is there a kernel
+primitive reachable from the JPEG userclient with client-controlled data? The classic shape is a
+client-supplied value used as a **kernel pointer** — so that is what this round checked, on the one
+field the teardown *releases*.
+
+### 13.1 `JpegRequest+0x2b8` is resolved from a 32-bit ID, not supplied
+
+A coverage-aware store sweep (any store whose address range covers `+0x2b8`, including `stp`/`str q`)
+finds exactly **two** writers in the whole kext:
+
+```
+0xfffffff009017e1c  str   x0,   [x19, #0x2b8]   ; the SET
+0xfffffff0090183f4  str   xzr,  [x19, #0x2b8]   ; the reset clear
+```
+
+and the set site is a **lookup**, not a copy from the client struct:
+
+```
+0x9017e0c  ldr   x0, [x20, #0x148]      ; the driver's IOSurface provider (mIOSurfaceRoot)
+0x9017e10  ldr   w1, [x19, #0x2ac]      ; <<< a 32-bit ID taken from the request
+0x9017e14  mov   x2, x22                ; a third argument (task-scoped lookup)
+0x9017e18  bl    #0xfffffff00903c6e8    ; -> 0xfffffff00a36cbb0, inside com.apple.iokit.IOSurface
+0x9017e1c  str   x0, [x19, #0x2b8]      ; store the RESOLVED object
+0x9017e20  cbz   x0, #0xfffffff009017e3c
+0x9017e24  mov   w22, #1
+0x9017e2c  bl    #0xfffffff00903c888    ; -> 0xfffffff00a35ea68, also in IOSurface -- a RETAIN
+```
+
+`0x903c6e8` resolves (via `__auth_got`) to `0xfffffff00a36cbb0`, which lies in
+`com.apple.iokit.IOSurface`'s `__TEXT_EXEC` (`0xa34e240..0xa386240`) — i.e. an
+`IOSurfaceRoot`-side lookup taking the provider, a **32-bit surface ID** and a task. The driver then
+**retains** the result before storing it, and the teardown releases it once.
+
+**⇒ No client-supplied pointer reaches a kernel dereference or a release on this path.** The client
+supplies an ID; the kernel resolves it, scoped to the caller's task, and refcounts it properly. The
+"controlled free of an attacker-chosen pointer" LPE is **refuted**.
+
+### 13.2 The other LPE avenues, and their status
+
+| avenue | status | evidence |
+|---|---|---|
+| client-supplied kernel pointer → controlled release | **REFUTED** | §13.1 — ID-based, task-scoped lookup + retain/release |
+| unvalidated `structureInputSize` on the external-method dispatch | **not present** | IOKit's `IOExternalMethodDispatch` enforces it; sel 7's record carries `structIn = structOut = 3488` and the real client sends 3488/3488 (§12.1) |
+| unvalidated array index | **not present** | `-fbounds-safety` checks on every index: `nseg` is bounded to {0,1} by `cmp w28, w8 ; b.hi -> error` at `0x902b260`; the codec-slot index is bounded in `finish_io_gated` |
+| client-supplied DMA address/length | **not present** | the descriptor is the IOSurface's own `IOBufferMemoryDescriptor` (§3); the segment walk is bounded by that descriptor |
+| opening the userclient from an app | **not available** | no kext declares `IOUserClientEntitlements`; AppleJPEGDriver hardcodes no entitlement; the only grants found are ImageIOXPCService's entitlement and the `AccessibilityOnboarding` / Accessory / Apple-Internal profiles — all system contexts, none an app container |
+
+### 13.3 The structural reason there is no LPE here
+
+The chain's **acting** process is `ImageIOXPCService` — a `platform-application` system service.
+An app asking ImageIO to decode an image is the *designed* interface, not an escalation; the
+service is already more privileged than the app. So an LPE requires a **kernel** memory-safety bug
+reachable from that service — and that is exactly what §9–§12 searched for, three times, with
+clean negatives each time.
+
+**Verdict: no LPE is demonstrated, and no LPE primitive is present.** The driver's hardening is
+unusually thorough: ID-based (not pointer-based) object resolution, refcount panics on both
+underflow and overflow, redundant clears on the DMA state, `-fbounds-safety` on every index, and
+IOKit's own size validation. Three independent hunts (refcount wrap, stale-slot double free, double
+finish) each looked promising and each died on a specific defence.
+
+---
+
+## 14. BOTTOM LINE
 
 The reachability question that has been open since §20.5 is **closed**: the JPEG chain's
 `IOMemoryDescriptor` is an `IOSurface`-owned **`IOBufferMemoryDescriptor`**, and that class's
