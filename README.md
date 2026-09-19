@@ -1,547 +1,404 @@
 # PRIV-24A435 audit
 
+> Static reverse-engineering audit of the iOS 27 kernel and privileged media stack, centered on **iOS 27.0 GM (24A435, iPhone17,5)** with selected cross-version validation against **24A437** and **27.2 beta 1 (24B5084k)**.
+
 > [!IMPORTANT]
 > This repository contains AI-assisted security research.
 > Every claim is intended to be independently reproducible from the supplied binaries, addresses, disassembly and scripts.
 
-Static reverse-engineering audit of **iOS 27.0 GM 24A435 (iPhone17,5)**, with cross-build validation against later iOS 27 builds.
+## Current headline
 
-The main investigation follows an `IOMemoryDescriptor::_dmaReferences` hardening change through XNU, `IODMACommand`, IOSurface, AppleJPEGDriver and the real userspace JPEG client.
+The strongest result in this repository is now an **AppleJPEGDriver / IOSurface lifetime bug chain**.
 
-## Current result
+A client-controlled request field can select an early teardown path after the JPEG hardware has already been started. On that path, `AppleJPEGDriver` releases two `IOSurface` objects stored in the request, does not clear the stored pointers, waits for approximately one second, and later dereferences one of those same pointers from the asynchronous completion path.
 
-The original reachability question is now closed:
+The driver itself contains **no matching retain** of either surface.
+
+Static analysis of the relevant `IOSurfaceRoot` lookup path likewise found no reference-count increment, and a survey of **45 lookup call sites across 12 importing kexts** found no peer consumer performing the corresponding `OSObject::release`.
+
+This strongly suggests that the lookup returns a **borrowed pointer**.
+
+If that ownership interpretation is correct, the JPEG teardown performs an **over-release of a client-supplied IOSurface**, potentially freeing it while the client's surface reference, the IOSurface ID table, and the driver's request still refer to the object.
+
+The driver then uses the stored pointer again from its completion path.
+
+**That would be a deterministic kernel use-after-free.**
+
+However:
+
+> **A full LPE has not been demonstrated.**
+>
+> The load-bearing ownership assumption has strong static evidence but has not yet been confirmed at runtime. No end-to-end reclaim or privilege-escalation exploit is provided.
+
+---
+
+## AppleJPEGDriver chain
+
+The relevant request path is:
 
 ```text
-sandboxed app / JPEG input
-        ↓
-ImageIO
-        ↓
-com.apple.ImageIOXPCService
-        ↓
-JPEGH1.videodecoder
-        ↓
+userspace / ImageIO path
+        |
+        v
 AppleJPEGDriverUserClient
-        ↓ selector 7
-IOCommandGate::runAction(queue_io_gated)
-        ↓
-AppleJPEGDart::mapMemoryDescriptor
-        ↓
-IOSurface
-        ↓
-IOBufferMemoryDescriptor
-        ↓
-IODMACommand::prepare
-        ↓
-dmaCommandOperation(op 5)
-        ↓
-_dmaReferences++
-        NO BOUND
+        |
+        | IOConnectCallStructMethod(...)
+        v
+start* handler
+        |
+        | structureInput + 0x30
+        v
+JpegRequest + 0x10
+        |
+        v
+queue_io_gated
+        |
+        +--> setupBuffersForCoding_gated
+        |       |
+        |       +--> IOSurfaceRoot lookup(id0)
+        |       |       -> req + 0x2c0
+        |       |
+        |       +--> IOSurfaceRoot lookup(id1)
+        |               -> req + 0x2b8
+        |
+        +--> hardware setup
+        |
+        +--> begin_io_gated
+        |
+        | if [req + 0x10] == 0
+        v
+checkDARTException
+        |
+        +--> OSObject::release(req + 0x2b8)
+        +--> OSObject::release(req + 0x2c0)
+        |
+        | pointers are NOT cleared
+        |
+        +--> IOSleep(10) x 100
+                ~1 second
+        |
+        v
+hardware completion
+        |
+        v
+finish_io_gated(async)
+        |
+        v
+collectCoreDataFromRequest
+        |
+        +--> load req + 0x2b8 / 0x2c0
+        |
+        v
+IOSurface code receives the stored pointer again
 ```
 
-The descriptor used by the JPEG DMA path is an IOSurface-owned
-**`IOBufferMemoryDescriptor`**.
+The trigger is a single client-controlled field:
 
-That matters because the two descriptor families behave differently:
+```c
+*(uint64_t *)(structureInput + 0x30) == 0
+```
 
-| descriptor family              | operation | `_dmaReferences` behavior              |
-| ------------------------------ | --------- | -------------------------------------- |
-| `IOGeneralMemoryDescriptor`    | op 3      | bounded increment added in iOS 27.0 GM |
-| **`IOBufferMemoryDescriptor`** | **op 5**  | **unbounded 16-bit atomic increment**  |
-
-The JPEG path uses the second one.
-
-The op-3 overflow hardening Apple added in 27.0 GM is therefore **not on the JPEG path**.
+That value is copied into `JpegRequest + 0x10` and determines whether teardown occurs immediately in `queue_io_gated` or later during normal completion.
 
 ---
 
 ## What is proven
 
-### 1. JPEG reaches the unbounded implementation
+### Client-controlled teardown gate
 
-The previously unresolved ARM64E `__auth_got` entry was an analysis error.
+`structureInput + 0x30` is copied directly into `req + 0x10`.
 
-For `DYLD_CHAINED_PTR_ARM64E_KERNEL`:
+The request constructor is the only writer found for this field.
+
+Therefore the client controls which lifetime path the request takes.
+
+### The surfaces are looked up and stored
+
+`setupBuffersForCoding_gated` performs two `IOSurfaceRoot` lookups and stores their results at:
 
 ```text
-bit 63 = auth
-bit 62 = bind
+req + 0x2b8
+req + 0x2c0
 ```
 
-The slot decodes as an authenticated rebase to:
+### AppleJPEGDriver does not retain them
+
+Every IOSurface entry point imported by the kext was enumerated and its call sites inspected.
+
+The operation previously suspected to be a retain (`0x903c888`) was disassembled and is instead a lock/flag operation.
+
+No independent surface retain was found anywhere in the driver.
+
+### The teardown releases both surfaces
+
+`checkDARTException` reaches the common teardown routine, which performs:
 
 ```text
-0xfffffff00a35b584
+OSObject::release(req + 0x2b8)
+OSObject::release(req + 0x2c0)
 ```
 
-inside `com.apple.iokit.IOSurface`.
+Neither request field is cleared afterwards.
 
-The target is effectively:
+### The pointers are used later
 
-```asm
-ldr x0, [x0, #0x30]
-ret
+The asynchronous completion path reaches:
+
+```text
+finish_io_gated
+    -> AppleJPEGCoreAnalyzer::collectCoreDataFromRequest
 ```
 
-and supplies the descriptor later passed to
-`AppleJPEGDart::mapMemoryDescriptor`.
+which loads one of those same request fields and passes it into IOSurface code.
 
-IOSurface's descriptor factories allocate from the
-**`IOBufferMemoryDescriptor` metaclass**; the IOSurface binary contains no
-`IOGeneralMemoryDescriptor` reference.
+This happens before the request gate is consulted.
+
+### The release/use window is unusually large
+
+The teardown contains:
+
+```text
+100 x IOSleep(10)
+```
+
+giving approximately a **one-second interval** between the early release and later completion processing.
 
 ---
 
-### 2. `IOBufferMemoryDescriptor` has no `_dmaReferences` ceiling
+## The remaining ownership question
 
-Its `dmaCommandOperation` implementation is:
+The central unresolved question is:
 
-```text
-0xfffffff00b3406a4
-```
+> Does `IOSurfaceRoot`'s lookup return an owned (`+1`) reference or a borrowed pointer?
 
-For this implementation:
+The current static evidence favors **borrowed**.
 
-```text
-op 3 → unsupported
-op 5 → retain helper
-```
+Three relevant lookup functions were disassembled end-to-end.
 
-The op-5 path reaches:
+No atomic reference-count increment was found.
 
-```asm
-add    x8, x0, #0x34
-mov    w9, #1
-ldaddh w9, w8, [x8]
-```
+No out-of-line retain on the returned object was identified.
 
-at:
+The successful lookup behaves like a table walk returning the object stored for the surface ID.
+
+As an independent cross-check, the same exported lookup was surveyed across its other consumers:
 
 ```text
-0xfffffff00b3409dc
+12 importing kexts
+45 call sites
 ```
 
-There is:
+None showed the `OSObject::release` pattern used by AppleJPEGDriver near the lookup.
+
+That makes the JPEG driver's ownership behavior anomalous.
+
+### Why this matters
+
+If the lookup is **owned**:
 
 ```text
-no sxth
-no cmp
-no upper bound
-no overflow panic
+lookup +1
+release -1
 ```
 
-The 16-bit counter can therefore increment through:
+the early release is balanced, leaving a large use-after-release window whose exploitability depends on another reference disappearing.
+
+If the lookup is **borrowed**:
 
 ```text
-0x4000
-0x8000
-0xffff
-0x0000
+lookup +0
+release -1
 ```
 
-at the machine-code level.
+the driver releases a reference it never owned.
+
+Under the reconstructed IOSurface lifetime model, that can free the object while its ID and other stale references remain live.
+
+That changes the chain into a deterministic over-release / UAF candidate.
+
+### Status
+
+| Claim                                             | Status                    |
+| ------------------------------------------------- | ------------------------- |
+| Client controls `req+0x10`                        | **PROVEN**                |
+| `== 0` selects early teardown                     | **PROVEN**                |
+| Driver does not independently retain the surfaces | **PROVEN**                |
+| Teardown calls `OSObject::release`                | **PROVEN**                |
+| Released pointers remain stored                   | **PROVEN**                |
+| Completion path dereferences them                 | **PROVEN**                |
+| Release → use window is ~1 s                      | **PROVEN**                |
+| IOSurface lookup is borrowed                      | **STRONG**                |
+| Early release actually frees the IOSurface        | **NOT RUNTIME-CONFIRMED** |
+| Attacker-controlled reclaim/type confusion        | **NOT DEMONSTRATED**      |
+| Full LPE                                          | **NOT DEMONSTRATED**      |
 
 ---
 
-### 3. The hardened op-3 path is skipped
+## Why the earlier rounds still matter
 
-`IODMACommand::setMemoryDescriptor` issues the op-3 pin only when:
+The JPEG lifetime work came out of a broader audit of the 24A435 kernel.
 
-```text
-fMapper == 0
-```
+### `_dmaReferences`
 
-The AppleJPEG command is created mapped with an `IODARTMapper`, therefore:
+The original investigation found a suspicious 16-bit DMA reference counter in `IOMemoryDescriptor`.
 
-```text
-fMapper != 0
-```
-
-and the op-3 call is skipped.
-
-The later prepare path instead reaches the kernel's op-5 issuer:
+The checked increment performs the equivalent of:
 
 ```text
-prepare
-  → IODMACommand slot 0xa0
-  → descriptor->dmaCommandOperation(op 5)
-  → IOBufferMemoryDescriptor
-  → retain helper
-  → _dmaReferences++
+atomic increment
+    -> signed interpretation of old 16-bit value
+    -> compare against 0x4000
 ```
 
-So the distinction is stronger than the original:
+while another descriptor family reaches an unbounded increment implementation.
 
-> It is not merely “one atomic increment lacks the new bound.”
+Later work established that the AppleJPEGDriver DMA chain uses an `IOBufferMemoryDescriptor`, i.e. the descriptor family whose relevant op-5 path reaches the unbounded increment.
 
-It is:
+The chain was traced through:
 
-> **one descriptor family received the bound; the descriptor family used by the JPEG path did not.**
+```text
+AppleJPEGDriver
+ -> IOSurface
+ -> IOBufferMemoryDescriptor
+ -> IODMACommand
+ -> dmaCommandOperation(op 5)
+ -> _dmaReferences increment
+```
+
+This remains a real and byte-verified lifetime/refcount anomaly.
+
+What has **not** been demonstrated is a practical way to drive the counter into a memory-corrupting state.
 
 ---
 
-## Full 24A435 chain
+## Research progression
 
-```text
-JPEG input
-  ↓
-ImageIO
-  ↓
-com.apple.ImageIOXPCService
-  ↓
-JPEGH1.videodecoder
-  ↓
-IOServiceMatching("AppleJPEGDriver")
-  ↓
-IOServiceOpen
-  ↓
-IOConnectCallStructMethod(selector 7, 3488-byte request)
-  ↓
-AppleJPEGDriverUserClient
-  ↓
-IOCommandGate::runAction(queue_io_gated)
-  ↓
-setupBuffersForCoding_gated
-  ↓
-AppleJPEGDart::mapMemoryDescriptor
-  ↓
-[IOSurface + 0x30]
-  ↓
-IOBufferMemoryDescriptor
-  ↓
-IODMACommand::withSpecification(kMapped)
-  ↓
-IODMACommand::setMemoryDescriptor
-      op 3 → SKIPPED
-  ↓
-IODMACommand::prepare
-  ↓
-dmaCommandOperation(op 5)
-  ↓
-IOBufferMemoryDescriptor retain helper
-  ↓
-ldaddh [descriptor + 0x34]
-  ↓
-UNBOUNDED _dmaReferences++
-```
+| Round              | Main result                                                                                                                                                            |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| DMA/refcount audit | Identified `_dmaReferences`, its checked and unchecked increment families, consumer, and asymmetric lifetime behavior                                                  |
+| JPEG reachability  | Closed the client → AppleJPEGDriver → IOSurface → DMA increment chain                                                                                                  |
+| LPE round 2        | Reconstructed `JpegRequest` lifetime; refuted the earlier double-finish and caller-struct UAF hypotheses; found client-controlled premature teardown and request leak  |
+| LPE round 3        | Found a real post-release consumer: the completion path dereferences the released IOSurface pointer                                                                    |
+| **LPE round 4**    | Traced IOSurface lookup ownership; evidence strongly favors borrowed semantics, turning the early release into a deterministic over-release/UAF candidate if confirmed |
 
-Every link in this static chain is now backed by binary evidence.
+An important part of this repository is documenting **refuted hypotheses as well as surviving ones**. Several initially promising candidates disappeared after reconstructing complete object lifetimes.
 
 ---
 
-# `_dmaReferences`: what it actually means
+## Earlier candidates that were closed
 
-A complete sweep of the relevant readers changes the severity interpretation.
+### Double `finish_io_gated`
 
-`_dmaReferences` behaves primarily as a **diagnostic/invariant counter**, not as an ownership
-reference that directly decides whether the descriptor may be freed.
+Earlier work considered whether the request could reach teardown twice and therefore double-release its IOSurface.
 
-The important consumers fall into three groups:
+Full lifecycle reconstruction showed that the relevant teardown conditions use opposite polarity on the same immutable request field.
 
-| behavior                    | result                                   |
-| --------------------------- | ---------------------------------------- |
-| reporting sites             | log / telemetry                          |
-| decrement while zero        | `vpanic` — `_dmaReferences underflow`    |
-| `complete()` while non-zero | `vpanic` — `complete() while dma active` |
+**Status: REFUTED.**
 
-There is no discovered:
+### Caller-struct alias
 
-```text
-if (_dmaReferences != 0)
-    refuse_to_free();
-```
+The JPEG request contains a client-influenced alias path that initially looked capable of producing a stale-pointer consumer.
 
-ownership decision.
+Recovered function identities and reader analysis showed no useful dereferencing consumer.
 
-This removes several cheap UAF interpretations from the original investigation.
+**Status: REFUTED as the escalation vehicle.**
 
----
+### Stale DMA command slot
 
-## The wrap hypothesis
+A possible stale-command/double-release path was investigated.
 
-Normal operation is balanced:
+The relevant slots are reset before reuse.
 
-```text
-prepare  → op 5 → ++
-complete → op 6 → --
-```
+**Status: REFUTED.**
 
-The op-5 increment is issued **once per command**, not once per DMA segment.
-
-The earlier hypothesis that a fragmented surface could produce thousands of increments during
-one decode was tested and **refuted**.
-
-A counter wrap therefore requires net imbalance.
-
-For the known leak shape, obtaining zero while a genuine DMA mapping is outstanding would require
-approximately:
-
-```text
-65,535 leaked prepares
-on the same persistent IOSurface descriptor
-
-        +
-
-1 genuine prepare
-        ↓
-counter wraps to zero
-
-        +
-
-completion while that mapping is live
-```
-
-No path capable of reliably producing this sequence has been demonstrated.
-
-Therefore:
-
-**the `_dmaReferences` wrap is a hardening defect, not a demonstrated UAF.**
+Keeping these failures documented is intentional: they constrain the remaining attack surface and make the surviving chain considerably more meaningful.
 
 ---
 
-# New AppleJPEG DMA teardown lead
+## What would settle the current finding
 
-The same investigation exposed a separate and substantially cheaper candidate in
-AppleJPEGDriver's own DMA bookkeeping.
+The highest-value next experiment is very small.
 
-`JpegRequest` contains descriptor/command pairs such as:
-
-```text
-descriptor  +0x2c8
-command     +0x300
-
-descriptor  +0x2d0
-command     +0x308
-```
-
-`AppleJPEGDart::mapMemoryDescriptor` writes the command output slot **only after successful
-mapping**.
-
-A failed map therefore leaves the old value in the command slot.
-
-The teardown later:
-
-1. reads the descriptor;
-2. reads the command slot;
-3. calls `unmapMemoryDescriptor`;
-4. clears the **descriptor**;
-5. does **not** clear the command slot.
-
-This creates the following candidate state:
+Determine whether:
 
 ```text
-descriptor = new/non-null
-command    = stale pointer to already released IODMACommand
+IOSurfaceRoot::lookupSurface(live_id)
 ```
 
-If the request object is reused and a subsequent map fails or is skipped before overwriting that
-slot, teardown can pass the stale command back into:
+increments the IOSurface retain count.
+
+A runtime retain-count observation or direct instrumentation of the lookup/release path would settle the ownership question.
+
+If the lookup is confirmed borrowed, the next useful test is simply whether one request with:
 
 ```text
-AppleJPEGDart::unmapMemoryDescriptor
+structureInput + 0x30 == 0
 ```
+
+causes the client's still-live surface to be destroyed or otherwise leaves the ID table referring to a dead object.
+
+Only after that result would reclaim/grooming work be justified.
 
 ---
 
-## Why this is interesting
+## Scope and methodology
 
-`unmapMemoryDescriptor` does not merely decrement some harmless reference.
+The project is primarily a static binary audit.
 
-It immediately uses the supplied command as an object:
+Techniques used across the rounds include:
 
-```asm
-ldr   x16, [x19]          ; load IODMACommand vtable
-autda x16, x17
-ldr   x8, [x16, #0x90]
-blraa x8, x16             ; indirect virtual call
-```
+* ARM64E chained-pointer decoding
+* kext VA attribution
+* `LC_FUNCTION_STARTS` recovery
+* typed `kalloc_type` / `kfree_type` lifecycle reconstruction
+* `os_log` string-based symbol recovery
+* authenticated vtable-call identification
+* cross-kext importer/call-site surveys
+* reference-count operation searches
+* selector and `IOCommandGate` reconstruction
+* shared-cache instruction-pattern sweeps
+* cross-version binary comparison
 
-So the stale-pointer scenario is genuinely **UAF-shaped**:
+The goal is not to turn every suspicious instruction sequence into a vulnerability claim.
+
+The standard used here is:
 
 ```text
-released IODMACommand
-        ↓
-stale command slot
-        ↓
-unmapMemoryDescriptor
-        ↓
-vtable load from freed object
-        ↓
-authenticated indirect call
+candidate
+    -> reachability
+    -> ownership/lifetime
+    -> consumer
+    -> consequence
+    -> runtime confirmation
 ```
 
-Pointer authentication makes straightforward control-flow exploitation unlikely; recycled memory
-would commonly be expected to fault rather than provide an immediately useful call target.
-
-But this is still materially different from a benign double `release()`.
+Claims are downgraded or removed when a later round disproves an earlier assumption.
 
 ---
 
-## What remains open for the double-release lead
+## Repository status
 
-Three links still decide whether it is a real reachable bug:
+The current result is best summarized as:
 
-1. **Request reuse**
+> **A client-controlled AppleJPEGDriver path releases a client-supplied IOSurface that the driver never independently retained, leaves the pointer stored, waits approximately one second, and later dereferences it from the completion path. Static analysis strongly indicates that the IOSurface lookup itself is borrowed, which would make the release an over-release and the later access a deterministic UAF. The ownership interpretation has not yet been confirmed at runtime, and no end-to-end LPE is claimed.**
 
-   It has not yet been proven that a `JpegRequest` carrying the stale command slot is reused for a
-   subsequent job.
-
-2. **Failure window**
-
-   A path must exist where the new descriptor has already been installed but the corresponding
-   `mapMemoryDescriptor` either fails or is skipped, leaving the stale command untouched.
-
-3. **User-controlled reachability**
-
-   It has not yet been demonstrated that the required state transition can be triggered through
-   attacker-controlled userclient input.
-
-Until those are closed:
-
-> **This is a concrete double-release/UAF-shaped lead, not a demonstrated UAF.**
+That is currently the strongest finding in the audit.
 
 ---
 
-# Other findings
+## Responsible research
 
-## MV-HEVC signed index
+This repository contains vulnerability research and reverse-engineering notes.
 
-`CAVDMvHevcDecoder::releaseUnusedPicturesFromOneSubDpb` contains the strongest surviving instance
-of the signed-index class examined during the audit:
+It intentionally distinguishes:
 
-```text
-64-entry array
-+
-signed-only upper-bound check
-+
-negative index accepted
-+
-sign-extended pointer-table index
-+
-pointer returned
-```
+* **PROVEN** — established directly from the analyzed binaries;
+* **STRONG** — supported by multiple independent static observations but missing a decisive confirmation;
+* **INFERRED** — follows from another unresolved assumption;
+* **NOT DEMONSTRATED** — plausible consequence for which no end-to-end evidence exists;
+* **REFUTED** — investigated and contradicted by later analysis.
 
-The full-corpus sweep found no second equivalent instance.
-
-Reachability and practical memory corruption remain separate questions.
-
----
-
-## AVE2 signed-product loop
-
-Another candidate uses a loop bound derived from:
-
-```text
-signed byte × signed byte
-```
-
-without an established relationship to the destination array length.
-
-Cross-build investigation did not establish that later AVE2 changes were a security fix.
-
-It remains a candidate, not a proven primitive.
-
----
-
-# Cross-build status
-
-The `_dmaReferences` implementation was compared against later iOS 27 binaries.
-
-The relevant guard and atomic operations survive into **27.2 beta 1 (24B5084k)**.
-
-In particular, the later build still contains:
-
-```text
-4 relevant atomic sites
-1 bounded
-3 unbounded
-```
-
-with the same functional roles.
-
-The `IOBufferMemoryDescriptor` retain path remains unbounded.
-
-So the issue is not merely a 24A435 GM artifact.
-
----
-
-# Current verdict
-
-| claim                                            | status                |
-| ------------------------------------------------ | --------------------- |
-| JPEG client → AppleJPEGDriver chain              | **PROVEN statically** |
-| JPEG reaches `IODMACommand`                      | **PROVEN**            |
-| descriptor comes from IOSurface                  | **PROVEN**            |
-| descriptor family is `IOBufferMemoryDescriptor`  | **PROVEN**            |
-| JPEG reaches unbounded op-5 `_dmaReferences++`   | **PROVEN**            |
-| hardened op-3 protects the JPEG path             | **REFUTED**           |
-| op-5 occurs once per segment                     | **REFUTED**           |
-| prepare/complete normally balance the counter    | **PROVEN**            |
-| `_dmaReferences` can wrap mathematically         | **PROVEN**            |
-| practical 65,535-net-increment drive             | **NOT DEMONSTRATED**  |
-| `_dmaReferences` UAF                             | **NOT PROVEN**        |
-| AppleJPEG stale-command / double-release shape   | **FOUND**             |
-| stale command is dereferenced through its vtable | **PROVEN**            |
-| request reuse + required map failure sequence    | **NOT PROVEN**        |
-| reachable AppleJPEG UAF                          | **NOT PROVEN**        |
-| LPE                                              | **NOT PROVEN**        |
-
-### Bottom line
-
-The original reachability question is closed:
-
-> **The JPEG path reaches the descriptor implementation whose `_dmaReferences` increment has no
-> upper bound. Apple's 27.0 GM op-3 hardening does not protect this path.**
-
-The severity question remains open.
-
-The `_dmaReferences` route has a quantified and very high bar to memory unsafety. Separately, the
-JPEG DMA teardown contains a much cheaper stale-command / double-release candidate that performs
-a virtual call through the supplied `IODMACommand`, but the request-lifecycle and attacker-control
-preconditions are not yet closed.
-
-In short:
-
-> **Reachable. Defective. Unfixed. Proven to use the unguarded descriptor implementation.
-> Memory corruption is still not proven.**
-
----
-
-## Research files
-
-The repository preserves the audit chronologically rather than rewriting earlier conclusions.
-
-| file                                  | role                                                                                         |
-| ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `priv24A435_xnu_refcount_findings.md` | original `_dmaReferences` guard analysis                                                     |
-| `priv24A435_xnu_reachability.md`      | first producer/reachability pass                                                             |
-| `priv24A435_dma_refcount_leak.md`     | increment/decrement asymmetry                                                                |
-| `priv24A435_dmaref_consumer.md`       | counter consumers                                                                            |
-| `priv24A435_dma_producer_reach.md`    | producer/gating survey                                                                       |
-| `priv24A435_kernel_rw_candidates.md`  | broader candidate sweep                                                                      |
-| `priv24A435_mvhevc_signed_index.md`   | MV-HEVC signed-index investigation                                                           |
-| `priv24A435_kernel_rw_round3.md`      | full shared-cache sweep and defused hypotheses                                               |
-| `priv24A435_27_2b1_diff_verdict.md`   | cross-build validation and JPEG client tracing                                               |
-| `priv24A435_reach_full_chain.md`      | descriptor-class proof, complete JPEG→unbounded-op5 chain, UAF attempt and DMA teardown lead |
-
-Earlier documents intentionally remain unchanged where possible so that mistakes, corrections and
-the evolution of the investigation are visible.
-
----
-
-## Methodology notes
-
-Several analysis mistakes produced useful reusable lessons:
-
-* ARM64E chained pointers: **bit 63 = auth, bit 62 = bind**.
-* Authenticated rebases must not be interpreted as unresolved imports.
-* Extracted kext `LC_SEGMENT_64` addresses are the authoritative runtime VA map used here.
-* Kernelcache section-based scans can silently fail where segment scans work.
-* `blraa` is a call and returns; treating it as a CFG terminator produces false loop results.
-* Direct caller counts are insufficient for `IOCommandGate` actions and other indirect callbacks.
-* Matching structure offsets across unrelated kernel objects are not evidence that the fields have
-  the same semantics.
-* Source-looking or textual diffs are leads; the final claims are based on machine-code paths.
+Corrections and independent reproduction are welcome.
 
 ---
 
